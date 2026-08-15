@@ -1,0 +1,22 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.identity.aauth
+name: AAuth Agent Identity Resolver
+license: Apache-2.0
+description: |
+  Resolves cryptographic AI-agent identity from AAuth-signed requests
+  (draft-hardt-oauth-aauth-protocol / draft-hardt-httpbis-signature-key).
+  Verifies the RFC 9421 HTTP Message Signature and the presented
+  `aa-agent+jwt` agent token against the issuing Agent Provider's published
+  JWKS (fetched once, cached, SSRF-egress-admitted), enforces the
+  proof-of-possession binding (the token's `cnf.jwk` must sign the request),
+  and maps the stable agent principal `aauth:local@domain` into the gateway
+  identity context. Replaces API keys / OAuth DCR with per-request,
+  self-sovereign agent identity. Verifies against an operator-configured
+  Agent-Provider allow-list; fails closed on bad config.
+class: identity_provider
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  # Agent-Provider metadata (`/.well-known/aauth-agent.json`) + JWKS discovery
+  # issue outbound HTTPS to the issuer named in the presented token.
+  - network_outbound

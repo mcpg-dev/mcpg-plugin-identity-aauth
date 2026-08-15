@@ -1,0 +1,37 @@
+[package]
+name = "mcpg-plugin-identity-aauth"
+version = "0.1.0-alpha.15"
+license = "Apache-2.0"
+edition = "2024"
+description = "AAuth agent-identity plugin for MCPG (dev.mcpg.identity.aauth) — verifies RFC 9421 HTTP Message Signatures + aa-agent+jwt agent tokens against a published JWKS; maps the cryptographic agent principal (aauth:local@domain) into the gateway identity context."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+metrics = "0.24"
+tracing = "0.1"
+# Egress-admitted JWKS / metadata fetch. Blocking client keeps the FFI
+# `resolve_identity` path synchronous (no bundled runtime); rustls only.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Crypto + primitives pinned to the versions the vendored `aauth-core`
+# (src/aauth/) was written and tested against — kept verbatim so its
+# RFC 8037/7638/8941/9421 test vectors stay green. These major versions
+# coexist with the rest of the tree (cargo-deny multiple-versions = warn).
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast", "zeroize"] }
+mcpg-aauth-core = { git = "https://github.com/mcpg-dev/mcpg-aauth-core", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+sha2 = "0.10"
+getrandom = "0.3"
+
+[features]
+# Default OFF so the workspace build (gateway bin included) does not link
+# multiple plugin rlibs all exporting `mcpg_plugin_register`. Standalone
+# cdylib builds opt in via `--features cdylib-export`.
+default = []
+cdylib-export = []
+static-firstparty = []
