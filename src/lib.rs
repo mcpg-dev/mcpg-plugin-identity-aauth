@@ -53,6 +53,8 @@ struct Inner {
     manifest: PluginManifest,
     config: AauthConfig,
     jwks: jwks::JwksResolver,
+    /// Present when the operator enabled `replay_protection`.
+    replay: Option<verifier::ReplayGuard>,
 }
 
 impl AauthIdentityPlugin {
@@ -71,11 +73,16 @@ impl AauthIdentityPlugin {
         });
 
         let jwks = jwks::JwksResolver::new(&config.jwks, config.insecure_dev_mode);
+        let replay = config
+            .replay_protection
+            .then(verifier::ReplayGuard::default);
 
         tracing::info!(
             plugin_id = PLUGIN_ID,
             trusted_issuers = config.trusted_issuers.len(),
             allow_any_issuer = config.allow_any_issuer,
+            person_tokens = config.person_tokens.enabled,
+            replay_protection = config.replay_protection,
             "identity.aauth: verifier compiled"
         );
 
@@ -89,6 +96,7 @@ impl AauthIdentityPlugin {
                 },
                 config,
                 jwks,
+                replay,
             }),
         }
     }
@@ -102,7 +110,7 @@ fn record_resolve_outcome(result: &IdentityResolution, elapsed: std::time::Durat
     };
     metrics::counter!("mcpg_identity_aauth_resolutions_total", "outcome" => outcome).increment(1);
     metrics::histogram!("mcpg_identity_aauth_resolve_ms").record(elapsed.as_millis() as f64);
-    if let IdentityResolution::Invalid { reason } = result {
+    if let IdentityResolution::Invalid { reason, .. } = result {
         warn!(reason = %reason, "identity.aauth: rejected AAuth credential");
     }
 }
@@ -152,10 +160,12 @@ fn resolve(
         &query,
         &inner.config,
         &inner.jwks,
+        inner.replay.as_ref(),
     ) {
         verifier::Outcome::NoCredential => IdentityResolution::None,
         verifier::Outcome::Rejected(err) => IdentityResolution::Invalid {
             reason: format!("{}: {}", err.code.as_str(), err.detail),
+            response_headers: error_response_headers(&err),
         },
         verifier::Outcome::Verified(vid) => IdentityResolution::Resolved {
             identity: build_identity(inner, *vid),
@@ -163,33 +173,124 @@ fn resolve(
     }
 }
 
+/// The response headers a `401` for this failure should carry: the
+/// machine-readable `Signature-Error` (the authoritative error channel — the
+/// draft says agents MUST NOT depend on the body), plus the
+/// `Accept-Signature-*` capability statements naming what WOULD succeed on
+/// the two recoverable errors.
+fn error_response_headers(err: &aauth::sig::SigError) -> Vec<(String, String)> {
+    let mut sig_error = format!("error={}", err.code.as_str());
+    if let Some(required) = &err.required_input {
+        let refs: Vec<&str> = required.iter().map(|s| s.as_str()).collect();
+        sig_error.push_str(&format!(
+            ", required_input={}",
+            aauth::sfv::serialize_string_list(&refs)
+        ));
+    }
+    let mut headers = vec![("signature-error".to_owned(), sig_error)];
+    match err.code {
+        aauth::sig::SigErrorCode::UnsupportedScheme => {
+            headers.push(("accept-signature-scheme".to_owned(), "jwt".to_owned()));
+        }
+        aauth::sig::SigErrorCode::UnsupportedAlgorithm => {
+            headers.push((
+                "accept-signature-alg".to_owned(),
+                aauth::jwt::SUPPORTED_ALGS.join(", "),
+            ));
+        }
+        _ => {}
+    }
+    headers
+}
+
 fn build_identity(inner: &Inner, vid: verifier::VerifiedIdentity) -> PluginIdentity {
-    let claims = vid.claims;
     let mut attributes: BTreeMap<String, String> = BTreeMap::new();
-    attributes.insert("aauth.jti".to_owned(), claims.jti);
-    if let Some(ps) = claims.ps {
-        attributes.insert("aauth.ps".to_owned(), ps);
-    }
-    if let Some(parent) = claims.parent_agent {
-        attributes.insert("aauth.parent_agent".to_owned(), parent);
-    }
+    let mut scopes: Vec<String> = Vec::new();
+    // Every AAuth credential binds the request to one key; its RFC 7638
+    // thumbprint is what a resource token names as `agent_jkt`, and the
+    // token's expiry bounds how long any state derived from it may live.
+    let (subject_id, issuer) = match vid {
+        verifier::VerifiedIdentity::Agent(claims) => {
+            // `sub` is `aauth:local@domain` — domain-qualified (verified
+            // against the issuer's host) and stable across the agent's key
+            // rotations. Use it directly as the principal; `issuer` carries
+            // the vouching AP for per-issuer trust policy downstream.
+            attributes.insert("aauth.token_type".to_owned(), "agent".to_owned());
+            insert_common(&mut attributes, &claims.jti, &claims.cnf.jwk, claims.exp);
+            if let Some(ps) = claims.ps {
+                attributes.insert("aauth.ps".to_owned(), ps);
+            }
+            if let Some(parent) = claims.parent_agent {
+                attributes.insert("aauth.parent_agent".to_owned(), parent);
+            }
+            (claims.sub, claims.iss)
+        }
+        verifier::VerifiedIdentity::Person(claims) => {
+            // A person `sub` is a directed OPAQUE identifier, unique within
+            // its issuing PS only — `(issuer, subject_id)` is the identifier,
+            // and downstream authorization MUST key on the pair, exactly as
+            // documented for `allow_any_issuer` agent identities.
+            attributes.insert("aauth.token_type".to_owned(), "person".to_owned());
+            insert_common(&mut attributes, &claims.jti, &claims.cnf.jwk, claims.exp);
+            // The person server that asserted this person is the token issuer.
+            attributes.insert("aauth.ps".to_owned(), claims.iss.clone());
+            if let Some(m) = claims.mission_s256 {
+                attributes.insert("aauth.mission_s256".to_owned(), m);
+            }
+            if let Some(t) = claims.tenant {
+                attributes.insert("aauth.tenant".to_owned(), t);
+            }
+            (claims.sub, claims.iss)
+        }
+        verifier::VerifiedIdentity::Auth(claims) => {
+            // The grant: the person is `(ps, sub)`; what is authorized is
+            // `scope`, which becomes the gateway's `scopes` so tool policy
+            // (`required_scopes`, CEL `identity.scopes`) applies unchanged.
+            attributes.insert("aauth.token_type".to_owned(), "auth".to_owned());
+            insert_common(&mut attributes, &claims.jti, &claims.cnf.jwk, claims.exp);
+            attributes.insert("aauth.ps".to_owned(), claims.ps.clone());
+            scopes = claims.scopes();
+            if let Some(a) = claims.account {
+                attributes.insert("aauth.account".to_owned(), a);
+            }
+            if let Some(m) = claims.mission_s256 {
+                attributes.insert("aauth.mission_s256".to_owned(), m);
+            }
+            if let Some(t) = claims.tenant {
+                attributes.insert("aauth.tenant".to_owned(), t);
+            }
+            (claims.sub, claims.iss)
+        }
+    };
 
     PluginIdentity {
         kind: inner.config.resolution.trust_level.clone(),
         trust_level: inner.config.resolution.trust_level.clone(),
-        // `sub` is `aauth:local@domain` — domain-qualified and stable across the
-        // agent's key rotations. Use it directly as the principal; `issuer`
-        // carries the vouching AP for per-issuer trust policy downstream.
-        subject_id: Some(claims.sub),
+        subject_id: Some(subject_id),
         auth_provider: Some(inner.config.resolution.auth_provider_label.clone()),
-        issuer: Some(claims.iss),
-        // Rung-1 agent tokens carry no scopes/roles/groups (those come from
-        // resource/auth tokens in rungs 2–4).
+        issuer: Some(issuer),
+        // Identity-mode tokens carry no roles/groups; scopes come only from
+        // an auth token's grant.
         roles: Vec::new(),
         groups: Vec::new(),
-        scopes: Vec::new(),
+        scopes,
         attributes,
     }
+}
+
+/// Attributes every AAuth credential yields: the token id (revocation and
+/// audit key, with `issuer`), the agent key's thumbprint, and the expiry.
+fn insert_common(
+    attributes: &mut BTreeMap<String, String>,
+    jti: &str,
+    cnf_jwk: &aauth::jwk::Jwk,
+    exp: u64,
+) {
+    attributes.insert("aauth.jti".to_owned(), jti.to_owned());
+    if let Ok(t) = cnf_jwk.thumbprint() {
+        attributes.insert("aauth.agent_jkt".to_owned(), t);
+    }
+    attributes.insert("aauth.exp".to_owned(), exp.to_string());
 }
 
 impl SyncIdentityResolver for AauthIdentityPlugin {
