@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-identity-aauth"
-version = "0.1.0-rc.5"
+version = "0.1.0"
 license = "Apache-2.0"
 edition = "2024"
 description = "AAuth agent-identity plugin for MCPG (dev.mcpg.identity.aauth) — verifies RFC 9421 HTTP Message Signatures + aa-agent+jwt agent tokens against a published JWKS; maps the cryptographic agent principal (aauth:local@domain) into the gateway identity context."
